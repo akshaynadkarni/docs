@@ -86,7 +86,7 @@ After the IdP is registered and READY:
 | Cloud provider admin | Platform SA `admin` | Private API: `osac login --private --token-script "oc create token …"` |
 | Break-glass | `{tenant}-osac-break-glass` | Password printed **once** on tenant create |
 | Tenant admin | `alice` | Public API: device login → tenant IdP (`--flow device`) |
-| Tenant viewer | `bob` | Public API: device login → tenant IdP |
+| Tenant user | `bob` | Public API: device login → tenant IdP |
 
 ### Private vs public API
 
