@@ -1,4 +1,4 @@
-# Tenant Onboarding Guide (Fulfillment API / CLI)
+# Tenant Identity and Access Guide (Fulfillment API / CLI)
 
 **Last Updated**: 2026-07-28  
 **Audience**: Cloud provider administrators, tenant administrators, developers validating fulfillment-service  
@@ -24,7 +24,7 @@
 - [Flow 9 — Add a project viewer](#flow-9--add-a-project-viewer)
 - [Flow 10 — Viewer IdP login again](#flow-10--viewer-idp-login-again)
 - [Flow 11 — Viewer lists project, cannot delete](#flow-11--viewer-lists-project-cannot-delete)
-- [Flow 12 — Delete membership, then project](#flow-12--delete-membership-then-project)
+- [Flow 12 — Delete the project](#flow-12--delete-the-project)
 - [Troubleshooting](#troubleshooting)
 - [Frequently Asked Questions](#frequently-asked-questions)
 
@@ -32,7 +32,8 @@
 
 ## Overview
 
-This guide shows how to onboard a new tenant on OSAC using the `osac` CLI end to end.
+This guide shows tenant identity and access on OSAC using the `osac` CLI end to end:
+create a tenant, attach an IdP, grant roles, and prove project RBAC.
 
 A **cloud provider administrator** creates the tenant. OSAC then sets up the basics for
 that tenant automatically (break-glass account, Keycloak organization, and Kubernetes
@@ -47,10 +48,10 @@ This guide covers:
 
 1. Create a tenant and confirm automatic onboarding (break-glass, org, namespace)
 2. Register a tenant-scoped OIDC identity provider
-3. Prove IdP users auto-join the tenant and receive OSAC `User` records (JIT)
+3. Prove IdP users auto-join the tenant and receive OSAC `User` records via just-in-time provisioning (JIT)
 4. Grant `tenant-admin` via RoleBinding and create a project
 5. Grant a project viewer via ProjectMembership and prove RBAC
-6. Clean up membership and project safely
+6. Delete the demo project (memberships are removed with it)
 
 ---
 
@@ -95,18 +96,6 @@ After the IdP is registered and READY:
 - **Public API** (`fulfillment-api…`): tenant-scoped operations after IdP login
   (projects, memberships, day-2 RBAC).
 
-### Auth model (IdP SSO)
-
-| Topic | Behavior |
-|-------|----------|
-| Company user login | `osac login --flow device` → browser → tenant IdP alias (for example `osac-corp-oidc`) |
-| Tenant-admin grant | OSAC **RoleBinding** with role `tenant-admin` — not a Keycloak password reset |
-| Viewer grant | **ProjectMembership** with `PROJECT_MEMBERSHIP_ROLE_VIEWER` |
-| Auto-join tenant | Successful IdP login adds the user to the Keycloak **organization** for the tenant |
-| OSAC `User` row | Created on the first **real API call** after login (JIT), for example `osac get projects` |
-| Break-glass password | Shown **only once** in `osac create` tenant output; later `osac get tenant` keeps `break_glass_user_id` only |
-| `osac get users` | Available to platform admin or `tenant-admin`. A viewer gets `PermissionDenied` |
-
 ### Checking the current user with `osac whoami`
 
 After any login, run:
@@ -135,7 +124,7 @@ This prints the identity from the **local CLI token** (username, tenant, roles).
 | 9 | Alice adds bob as project viewer (ProjectMembership) |
 | 10 | Bob logs in again via IdP |
 | 11 | Bob can list the project but cannot delete it |
-| 12 | Alice deletes memberships, then deletes the project |
+| 12 | Alice deletes the project |
 
 ---
 
@@ -150,6 +139,8 @@ Before starting, you need:
 | `osac` CLI | Installed and configured for your cluster API endpoint |
 | `curl` / `jq` | Used only to verify Keycloak organization side effects |
 | Tenant IdP | OIDC-capable IdP (or a lab mock) with a confidential client for OSAC’s broker redirect URI |
+
+`--insecure` and `curl -sk` are lab-only (self-signed certs); in production, omit them and trust your cluster CA.
 
 ---
 
@@ -171,7 +162,7 @@ export TENANT_ADMIN=alice
 export TENANT_USER=bob
 export OSAC="https://fulfillment-internal-api-${NS}.${DOMAIN}"
 export OSAC_PUBLIC="https://fulfillment-api-${NS}.${DOMAIN}"
-export KC="https://keycloak-keycloak.${DOMAIN}"
+# KC is set from the Keycloak route when you run org verification curls (same host as --resolve)
 mkdir -p /tmp/osac-demo
 echo "Flow 0 OK: TENANT=$TENANT ADMIN=$TENANT_ADMIN USER=$TENANT_USER"
 ```
@@ -203,8 +194,8 @@ metadata:
   name: ${TENANT}
 EOF
 
-# Save create output (includes one-time break-glass password)
-osac create -f /tmp/osac-demo/tenant.yaml | tee /tmp/osac-demo/tenant-create.txt
+# Break-glass password prints once — copy it now; do not save to a file
+osac create -f /tmp/osac-demo/tenant.yaml
 osac get tenants
 ```
 
@@ -287,6 +278,7 @@ export KC_ADMIN_USER="<keycloak-master-admin-user>"
 export KC_ADMIN_PASSWORD="<keycloak-master-admin-password>"
 
 KEYCLOAK_ROUTE=$(oc get route keycloak -n keycloak -o jsonpath='{.spec.host}')
+export KC="https://${KEYCLOAK_ROUTE}"
 KC_TOKEN=$(curl -sk --resolve "${KEYCLOAK_ROUTE}:443:${INGRESS_IP}" \
   -X POST "${KC}/realms/master/protocol/openid-connect/token" \
   -d "grant_type=password&client_id=admin-cli&username=${KC_ADMIN_USER}&password=${KC_ADMIN_PASSWORD}" \
@@ -439,6 +431,7 @@ Optional — confirm alice joined the Keycloak organization (reuse `KC_ADMIN_USE
 
 ```bash
 KEYCLOAK_ROUTE=$(oc get route keycloak -n keycloak -o jsonpath='{.spec.host}')
+export KC="https://${KEYCLOAK_ROUTE}"
 KC_TOKEN=$(curl -sk --resolve "${KEYCLOAK_ROUTE}:443:${INGRESS_IP}" \
   -X POST "${KC}/realms/master/protocol/openid-connect/token" \
   -d "grant_type=password&client_id=admin-cli&username=${KC_ADMIN_USER}&password=${KC_ADMIN_PASSWORD}" \
@@ -664,7 +657,20 @@ is denied (`PermissionDenied`).
 source /tmp/osac-demo/proj-id.sh
 osac whoami
 osac get projects
-osac delete project "${PROJ_ID}" || true
+
+# Expect PermissionDenied — fail the check if delete succeeds or returns another error
+set +e
+out=$(osac delete project "${PROJ_ID}" 2>&1)
+rc=$?
+set -e
+echo "$out"
+if [[ $rc -eq 0 ]]; then
+  echo "RBAC check failed: viewer was able to delete the project" >&2
+  exit 1
+fi
+echo "$out" | grep -q PermissionDenied \
+  || { echo "RBAC check failed: expected PermissionDenied, got: $out" >&2; exit 1; }
+echo "RBAC check OK: viewer cannot delete project"
 ```
 
 **Expected output:**
@@ -675,20 +681,18 @@ shared     -         -        -        -                ACTIVE
 osac-corp  -         -        -        -                UNSPECIFIED
 osac-corp  -         -        default  Default Project  ACTIVE
 Failed to delete project '<PROJ_ID>': rpc error: code = PermissionDenied desc = permission denied
+RBAC check OK: viewer cannot delete project
 ```
 
 (`osac get users` as bob → `PermissionDenied` is also normal.)
 
 ---
 
-## Flow 12 — Delete membership, then project
+## Flow 12 — Delete the project
 
-**What this flow does:** Alice returns via IdP and tears down the demo project.
-**Order matters:** delete ProjectMembership(s) **first**, then the project. Leaving a
-membership attached can leave the project stuck with `DELETING=Yes`.
-
-Use the **real UUID** from `osac get projectmemberships` — never a literal `<pm-id>`
-(bash treats `<` as redirection).
+**What this flow does:** Alice returns via IdP and deletes the demo project.
+ProjectMemberships are removed automatically when the project is deleted. Delete can
+still fail if other resources remain in the project.
 
 ```bash
 source /tmp/osac-demo/proj-id.sh
@@ -698,14 +702,6 @@ osac login --insecure --address "${OSAC_PUBLIC}" --flow device
 # Browser: Incognito → <tenant-idp-alias> → alice
 
 osac whoami
-osac get projectmemberships
-
-osac get projectmemberships 2>/dev/null \
-  | awk -v t="${TENANT}" 'NR>1 && $1==t {print $3}' \
-  | while read -r pmid; do
-      [[ -n "$pmid" && "$pmid" != "-" ]] && osac delete projectmembership "$pmid" || true
-    done
-
 osac delete project "${PROJ_ID}"
 osac get projects
 ```
@@ -721,11 +717,11 @@ shared     -         -        -     -      ACTIVE
 osac-corp  -         -        -     -      UNSPECIFIED   # root remains — OK
 ```
 
-If the project remains `DELETING=Yes` after memberships are gone, clear finalizers as a
-last resort (lab workaround):
+If the project remains `DELETING=Yes`, clear finalizers as a last resort (lab
+workaround):
 
 ```bash
-# Only if stuck after membership delete
+# Only if stuck
 osac edit project "${PROJ_ID}"
 # remove metadata.finalizers, save
 ```
@@ -743,7 +739,7 @@ osac edit project "${PROJ_ID}"
 | `osac get users` missing bob after device login | No JIT User | As bob, run a real API call (`osac get projects`) |
 | ProjectMembership `PermissionDenied` | Older fulfillment image | Upgrade; product path requires tenant-admin ProjectMembership support |
 | ProjectMembership FAILED | Wrong user UUID / column parse | Re-run `osac get users` and confirm UUID for bob |
-| Project stuck `DELETING=Yes` | Membership still attached | Delete ProjectMembership first, then project |
+| Project stuck `DELETING=Yes` | Other resources still in the project, or finalizers | Remove remaining resources; clear finalizers only as a lab last resort |
 | `whoami` looks fine but membership fails | `whoami` does not JIT User | Call `osac get projects` (or create) once per user |
 | Nameless project `STATE=UNSPECIFIED` | Tenant root auto-created | Expected — not the Flow 8 `default` project |
 
@@ -769,10 +765,10 @@ ProjectMembership.
 Bob is a ProjectMembership **VIEWER**. Listing is allowed; delete requires a higher
 role (and in this guide, the creator / tenant-admin path shown in Flow 12).
 
-### Why must I delete ProjectMembership before deleting the project?
+### Why can project delete fail even for tenant-admin?
 
-Leaving memberships attached can leave the project stuck with `DELETING=Yes`. Delete
-memberships first, then the project.
+ProjectMemberships are removed with the project. Delete can still fail if other
+resources remain in the project, or if you are not the creator path this guide covers.
 
 ### Do I need the OSAC UI for this guide?
 
